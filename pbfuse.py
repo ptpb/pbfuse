@@ -7,6 +7,7 @@ from urllib import parse
 from dateutil.parser import parse as dt_parse
 from itertools import count
 from collections import defaultdict
+from enum import IntEnum
 from datetime import datetime
 from time import monotonic
 import requests
@@ -57,8 +58,10 @@ class Client():
         res = self.session.put(url, files=files)
         return res.json()
 
-INO_CUR = 2
-INO_NEW = 3
+class Inode(IntEnum):
+    root = 1
+    cur = 2
+    new = 3
 
 class Operations(llfuse.Operations):
     def __init__(self):
@@ -66,30 +69,36 @@ class Operations(llfuse.Operations):
 
         self.client = Client()
 
-        self._inodes = count(4)
-
-        self._cache = {}
-
-        self._lookup = defaultdict(dict)
-        self._lookup.update({
-            1: {b'cur': INO_CUR, b'new': INO_NEW}
-        })
-
-        self._metadata = {}
-
-        self._stat = {
-            1: stat.S_IFDIR | 0o555,
-            INO_CUR: stat.S_IFDIR | 0o555,
-            INO_NEW: stat.S_IFDIR | 0o755
+        self._state = {
+            '_inodes': count(4),            # global inode counter
+            '_session': count(3),           # global session counter
+            '_sessions': defaultdict(dict), # maps [fh]            -> ['inode'], ['buf']
+            '_lookup': defaultdict(dict),   # maps [inode_p][name] -> inode
+            '_content': {},                 # maps [inode]         -> paste_content
+            '_metadata': {},                # maps [inode]         -> paste_meta
+            '_stat': {},                    # maps [inode]         -> st_mode
+            '_link': {},                    # maps [inode]         -> link destination
         }
 
-        self._link = {}
+        self._stat.update({
+            Inode.root: stat.S_IFDIR | 0o555,
+            Inode.cur: stat.S_IFDIR | 0o555,
+            Inode.new: stat.S_IFDIR | 0o755
+        })
 
-        self._session = count(3)
-        self._sessions = defaultdict(dict)
+        self._lookup.update({
+            Inode.root: {b'cur': Inode.cur, b'new': Inode.new}
+        })
+
+    def __getattr__(self, name):
+        try:
+            return self._state[name]
+        except KeyError:
+            return super().__getattr__(name)
 
     def create(self, inode_p, name, mode, flags, ctx):
-        if inode_p != INO_NEW:
+
+        if inode_p != Inode.new:
             raise llfuse.FUSEError(errno.EPERM)
 
         try:
@@ -99,10 +108,10 @@ class Operations(llfuse.Operations):
 
         inode_r = next(self._inodes)
         self._metadata[inode_r] = res
-        self._lookup[INO_CUR][res['short'].encode('utf-8')] = inode_r
+        self._lookup[Inode.cur][res['short'].encode('utf-8')] = inode_r
 
         inode = next(self._inodes)
-        self._lookup[INO_NEW][name] = inode
+        self._lookup[Inode.new][name] = inode
         self._stat[inode] = stat.S_IFLNK | 0o444
         self._link[inode] = '../cur/{}'.format(res['short']).encode('utf-8')
 
@@ -116,11 +125,12 @@ class Operations(llfuse.Operations):
 
     def lookup(self, inode_p, name):
         try:
+            print(inode_p, name)
             return self.getattr(self._lookup[inode_p][name])
         except KeyError:
             pass
 
-        if inode_p != INO_CUR:
+        if inode_p != Inode.cur:
             raise llfuse.FUSEError(errno.ENOENT)
 
         try:
@@ -141,10 +151,13 @@ class Operations(llfuse.Operations):
         if off != 0:
             raise StopIteration
 
+        # fixme
         off = -1
 
         for name, cinode in self._lookup[inode].items():
-            llfuse.invalidate_entry(inode, name)
+            if inode == Inode.new:
+                # we tell lies in create(), which the kernel caches
+                llfuse.invalidate_entry(inode, name)
             yield (name, self.getattr(cinode), -1)
 
     def getattr(self, inode):
@@ -176,60 +189,70 @@ class Operations(llfuse.Operations):
 
         return fh
 
+    def _resymlink(self, old_target, new_target):
+        for inode, target in self._link.items():
+            if old_target in target:
+                self._link[inode] = '../cur/{}'.format(new_target.decode('utf-8')).encode('utf-8')
+
     def release(self, fh):
         if 'buf' in self._sessions[fh]:
-            inode = self._sessions[fh]['inode']
+            inode, buf = [self._sessions[fh][k] for k in ('inode', 'buf')]
+            buf = bytes(buf)
             uuid = self._metadata[inode]['uuid']
-            buf = self._sessions[fh]['buf']
             res = self.client.put(uuid, buf)
             if res['status'] != 'updated':
+                del self._sessions[fh]
                 raise llfuse.FUSEError(errno.EIO)
 
-            self._cache[inode] = buf
+            # create new dirent
+            new_name = res['short'].encode('utf-8')
+            self._lookup[Inode.cur][new_name] = inode
 
-            self._lookup[INO_CUR][res['short'].encode('utf-8')] = inode
+            # remove old dirent
+            old_name = self._metadata[inode]['short'].encode('utf-8')
+            del self._lookup[Inode.cur][old_name]
 
-            short = self._metadata[inode]['short'].encode('utf-8')
-            for key, value in self._link.items():
-                if short in value:
-                    self._link[key] = '../cur/{}'.format(res['short']).encode('utf-8')
+            # update symlinks
+            self._resymlink(old_name, new_name)
 
-            del self._lookup[INO_CUR][short]
+            # update metadata and content caches
+            self._content[inode] = buf
             self._metadata[inode].update(res)
 
         del self._sessions[fh]
 
     def setattr(self, inode, attr):
+        # no-op
         return self.getattr(inode)
 
     def read(self, fh, offset, length):
         inode = self._sessions[fh]['inode']
 
-        if inode in self._cache:
-            return self._cache[inode][offset:offset+length]
+        if inode in self._content:
+            return self._content[inode][offset:offset+length]
 
         uri = self._metadata[inode]['digest']
         res = self.client.get(uri)
-        self._cache[inode] = res.content
+        self._content[inode] = res.content
 
         return res.content[offset:offset+length]
 
-    def write(self, fh, offset, buf):
+    def write(self, fh, offset, ibuf):
         if fh not in self._sessions:
             fh = self.open(fh, None)
-        inode = self._sessions[fh]['inode']
 
         if 'buf' not in self._sessions[fh]:
-            self._sessions[fh]['buf'] = b''
+            self._sessions[fh]['buf'] = bytearray()
 
-        self._sessions[fh]['buf'] += buf
+        buf = self._sessions[fh]['buf']
+        buf[offset:offset+len(ibuf)] = ibuf
 
         return len(buf)
 
 if __name__ == '__main__':
     operations = Operations()
 
-    llfuse.init(operations, sys.argv[1], [])
+    llfuse.init(operations, sys.argv[1], ['debug'])
     try:
         llfuse.main(single=True)
     except:
