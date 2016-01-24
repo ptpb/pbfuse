@@ -11,6 +11,10 @@ from enum import IntEnum
 from datetime import datetime
 from time import monotonic
 import requests
+from xdg import BaseDirectory
+from os import path
+
+import yaml
 
 class PBSession(requests.Session):
     def request(self, method, url, **kwargs):
@@ -248,6 +252,18 @@ class Operations(llfuse.Operations):
         buf[offset:offset+len(ibuf)] = ibuf
 
         return len(buf)
+
+    def init(self):
+        print('pbfuse init')
+        for base in BaseDirectory.load_data_paths('pbfuse'):
+            with open(path.join(base, 'state.yaml')) as f:
+                self._state.update(yaml.load(f))
+
+    def destroy(self):
+        print('pbfuse destroy')
+        base = BaseDirectory.save_data_path('pbfuse')
+        with open(path.join(base, 'state.yaml'), 'w') as f:
+            yaml.dump(self._state, f)
 
 if __name__ == '__main__':
     operations = Operations()
